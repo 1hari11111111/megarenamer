@@ -266,36 +266,30 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     import asyncio as _asyncio, functools as _functools
 
-    m = None
-    login_error = None
+    # ── mega.py quirk: login() always returns the Mega instance (self),
+    #   even on wrong credentials. The only reliable verification is to
+    #   call get_files() or get_user() after login and catch the error there.
+    #   We run all blocking calls in a thread executor to avoid blocking asyncio.
+    loop = _asyncio.get_event_loop()
+    verified = False
+    err_str = ""
     try:
-        # Run blocking mega.py login() in a thread executor
-        loop = _asyncio.get_event_loop()
         _mega = Mega()
-        m = await loop.run_in_executor(
+        # Step 1: login (always "succeeds" at the object level)
+        await loop.run_in_executor(
             None, _functools.partial(_mega.login, email, password)
         )
+        # Step 2: actually verify by fetching account info — this throws on bad creds
+        await loop.run_in_executor(None, _mega.get_user)
+        verified = True
     except Exception as exc:
-        login_error = exc
-        logger.warning("MEGA login exception for user %s: %s", user.id, exc)
+        err_str = str(exc)
+        logger.warning("MEGA credential check failed for user %s: %s", user.id, exc)
 
-    # Confirm session is truly alive by fetching account info
-    if m is not None and login_error is None:
-        try:
-            loop = _asyncio.get_event_loop()
-            await loop.run_in_executor(None, m.get_user)
-        except Exception as exc:
-            login_error = exc
-            m = None
-            logger.warning("MEGA get_user failed for user %s: %s", user.id, exc)
-
-    if m is None:
-        err_str = str(login_error) if login_error else "Unknown error"
+    if not verified:
         await wait_msg.edit_text(
-            "❌ *Login failed.*\n\n"
-            "Please double-check your MEGA email and password.\n"
-            "⚠️ If you have 2FA enabled on MEGA, disable it first.\n\n"
-            f"Error: `{err_str[:200]}`",
+            "\u274c *Login failed.* Wrong email or password.\n\n"
+            f"Detail: `{err_str[:200]}`",
             parse_mode="Markdown",
         )
         return
