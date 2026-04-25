@@ -74,9 +74,9 @@ def get_user(user_id: int) -> Optional[dict]:
 
 def upsert_user(user_id: int, username: Optional[str], update_fields: dict) -> dict:
     """Create or update a user document. Returns the updated document."""
-    base = {
+    # $setOnInsert only runs on NEW documents — must NOT overlap with $set keys
+    insert_defaults = {
         "user_id":          user_id,
-        "username":         username or "",
         "plan":             config.DEFAULT_PLAN,
         "plan_expiry":      None,
         "used_today_gb":    0.0,
@@ -84,9 +84,14 @@ def upsert_user(user_id: int, username: Optional[str], update_fields: dict) -> d
         "total_renamed_gb": 0.0,
         "joined_date":      date.today().isoformat(),
     }
+    # Remove any keys from insert_defaults that are also in update_fields
+    # to prevent MongoDB "conflict" error (code 40)
+    for key in update_fields:
+        insert_defaults.pop(key, None)
+
     users_col.update_one(
         {"user_id": user_id},
-        {"$setOnInsert": base, "$set": update_fields},
+        {"$setOnInsert": insert_defaults, "$set": update_fields},
         upsert=True,
     )
     return users_col.find_one({"user_id": user_id})
