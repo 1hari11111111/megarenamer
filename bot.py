@@ -738,23 +738,39 @@ def build_application() -> Application:
 #  Entry point
 # ════════════════════════════════════════════════════════════
 
-def _run_bot():
-    """Run the Telegram bot in its own event loop (blocking)."""
+def _run_flask():
+    """Run Flask health-check server in a background daemon thread."""
+    logger.info("Starting Flask on port %s", config.PORT)
+    flask_app.run(host="0.0.0.0", port=config.PORT, use_reloader=False)
+
+
+def _run_bot_async():
+    """Start the bot in a background thread without signal handlers (Gunicorn mode)."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     tg_app = build_application()
-    tg_app.run_polling(drop_pending_updates=True)
+
+    async def _start():
+        await tg_app.initialize()
+        await tg_app.updater.start_polling(drop_pending_updates=True)
+        await tg_app.start()
+        # Keep the loop alive indefinitely
+        await asyncio.Event().wait()
+
+    loop.run_until_complete(_start())
 
 
 if __name__ == "__main__":
-    # ── Local dev: run Flask + bot in separate threads ────────
-    bot_thread = threading.Thread(target=_run_bot, daemon=True)
-    bot_thread.start()
+    # ── Local dev ─────────────────────────────────────────────
+    # Flask in background thread; bot in main thread (required for signal handlers)
+    flask_thread = threading.Thread(target=_run_flask, daemon=True)
+    flask_thread.start()
 
-    port = config.PORT
-    logger.info("Starting Flask on port %s", port)
-    flask_app.run(host="0.0.0.0", port=port)
+    tg_app = build_application()
+    tg_app.run_polling(drop_pending_updates=True)   # blocks main thread
 else:
-    # ── Gunicorn / production: start bot thread on import ─────
-    bot_thread = threading.Thread(target=_run_bot, daemon=True)
+    # ── Gunicorn / production ──────────────────────────────────
+    # Gunicorn owns the main thread → bot runs in a background thread
+    # using a manual async loop (no signal handlers = no crash).
+    bot_thread = threading.Thread(target=_run_bot_async, daemon=True)
     bot_thread.start()
