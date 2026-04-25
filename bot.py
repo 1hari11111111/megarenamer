@@ -666,10 +666,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "cb_status":
-        # Reuse the /status logic by faking an update
         user_doc = get_user(query.from_user.id)
         if not user_doc:
-            await query.message.reply_text("Send /start first!")
+            await query.message.edit_text("Send /start first!")
             return
         user_doc    = refresh_plan_and_quota(user_doc)
         plan        = user_doc.get("plan", "FREE")
@@ -691,10 +690,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"├ Remaining   : {remaining_str}\n"
             f"└ Resets in   : {quota_reset_hours()}"
         )
-        await query.message.reply_text(text, parse_mode="Markdown")
+        # Back button to return to /start view
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back", callback_data="cb_back")]
+        ])
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
     elif query.data == "cb_plans":
-        # Forward to /plans display
         lines = ["💎 *Premium Plans*\n"]
         for plan_key, plan_data in config.PLANS.items():
             limit = plan_data["daily_gb"]
@@ -706,11 +708,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         lines.append("\nTo upgrade, contact the admin 👇")
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛒 Buy Now", url=config.ADMIN_CONTACT)]
+            [InlineKeyboardButton("🛒 Buy Now", url=config.ADMIN_CONTACT)],
+            [InlineKeyboardButton("🔙 Back", callback_data="cb_back")],
         ])
-        await query.message.reply_text(
+        await query.message.edit_text(
             "\n".join(lines), parse_mode="Markdown", reply_markup=keyboard
         )
+
+    elif query.data == "cb_back":
+        # Restore the original /start message
+        user_doc = get_user(query.from_user.id)
+        user     = query.from_user
+        if user_doc:
+            user_doc = refresh_plan_and_quota(user_doc)
+        text = (
+            f"👋 *Welcome, {user.first_name}!*\n\n"
+            f"I can rename files on your MEGA cloud drive — fast and securely.\n\n"
+            f"📦 *Your Plan:* {plan_status_text(user_doc) if user_doc else 'Unknown'}\n\n"
+            f"*Commands:*\n"
+            f"• /login `<email> <password>` — connect your MEGA account\n"
+            f"• /rename `<old_name> <new_name>` — rename a file\n"
+            f"• /status — view your quota\n"
+            f"• /plans — see premium options\n"
+            f"• /logout — disconnect account\n"
+        )
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
 
 
 # ════════════════════════════════════════════════════════════
