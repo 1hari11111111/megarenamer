@@ -172,7 +172,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("💎 Premium Plans", callback_data="cb_plans"),
         ],
         [
-            InlineKeyboardButton("📢 Updates Channel", url="https://t.me/YourChannelUsername"),
+            InlineKeyboardButton("📢 Updates Channel", url="https://t.me/km_botzs"),
         ],
     ])
 
