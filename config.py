@@ -15,7 +15,7 @@ ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").encode() # Fernet key (bytes)
 PORT           = int(os.getenv("PORT", 8080))
 
 # Admin contact link shown on /plans (change to your Telegram username)
-ADMIN_CONTACT  = "https://t.me/YourAdminUsername"
+ADMIN_CONTACT  = "https://t.me/hari_812"
 
 # ── Premium Plans ────────────────────────────────────────────
 # Each plan defines:
