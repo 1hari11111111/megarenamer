@@ -273,25 +273,47 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = _asyncio.get_event_loop()
     verified = False
     err_str = ""
-    try:
-        _mega = Mega()
-        # Step 1: login (always "succeeds" at the object level)
-        await loop.run_in_executor(
-            None, _functools.partial(_mega.login, email, password)
-        )
-        # Step 2: actually verify by fetching account info — this throws on bad creds
-        await loop.run_in_executor(None, _mega.get_user)
-        verified = True
-    except Exception as exc:
-        err_str = str(exc)
-        logger.warning("MEGA credential check failed for user %s: %s", user.id, exc)
+    # Retry up to 3 times for transient network/JSON errors from MEGA API
+    for attempt in range(3):
+        try:
+            _mega = Mega()
+            # Step 1: login (always "succeeds" at the object level)
+            await loop.run_in_executor(
+                None, _functools.partial(_mega.login, email, password)
+            )
+            # Step 2: actually verify by fetching account info — this throws on bad creds
+            await loop.run_in_executor(None, _mega.get_user)
+            verified = True
+            break
+        except Exception as exc:
+            err_str = str(exc)
+            logger.warning("MEGA credential check failed for user %s (attempt %d): %s", user.id, attempt + 1, exc)
+            # Only retry on JSON/network errors, not auth errors
+            is_json_error = "Expecting value" in err_str or "JSONDecodeError" in err_str
+            if not is_json_error or attempt == 2:
+                break
+            await _asyncio.sleep(2)  # Wait 2s before retry
 
     if not verified:
-        await wait_msg.edit_text(
-            "\u274c *Login failed.* Wrong email or password.\n\n"
-            f"Detail: `{err_str[:200]}`",
-            parse_mode="Markdown",
-        )
+        # Distinguish between a network/API error and actual wrong credentials
+        is_json_error = "Expecting value" in err_str or "JSONDecodeError" in err_str
+        if is_json_error:
+            error_msg = (
+                "❌ *Login failed — MEGA API Error.*\n\n"
+                "Could not reach MEGA's servers. This is usually caused by:\n"
+                "• A temporary MEGA API outage\n"
+                "• Network/firewall blocking the connection\n"
+                "• An outdated `mega.py` library version\n\n"
+                "Your email and password are likely *correct*. Please try again in a few minutes.\n\n"
+                f"Error: `{err_str[:200]}`"
+            )
+        else:
+            error_msg = (
+                "❌ *Login failed.* Wrong email or password.\n\n"
+                "⚠️ If you have 2FA enabled on MEGA, disable it first.\n\n"
+                f"Detail: `{err_str[:200]}`"
+            )
+        await wait_msg.edit_text(error_msg, parse_mode="Markdown")
         return
 
     # ── Encrypt and persist ──────────────────────────────────
