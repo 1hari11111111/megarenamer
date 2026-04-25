@@ -14,6 +14,7 @@ import logging
 import os
 import threading
 from datetime import date, datetime, timedelta, timezone
+from typing import Optional
 
 from flask import Flask
 from mega import Mega
@@ -66,12 +67,12 @@ def health():
 #  DB helpers
 # ════════════════════════════════════════════════════════════
 
-def get_user(user_id: int) -> dict | None:
+def get_user(user_id: int) -> Optional[dict]:
     """Fetch user doc from MongoDB. Returns None if not found."""
     return users_col.find_one({"user_id": user_id})
 
 
-def upsert_user(user_id: int, username: str | None, update_fields: dict) -> dict:
+def upsert_user(user_id: int, username: Optional[str], update_fields: dict) -> dict:
     """Create or update a user document. Returns the updated document."""
     base = {
         "user_id":          user_id,
