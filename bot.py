@@ -138,8 +138,23 @@ def mega_login_from_doc(user_doc: dict):
     email    = decrypt(enc_email)
     password = decrypt(enc_password)
 
-    mega = Mega()
-    m    = mega.login(email, password)
+    import asyncio as _asyncio, functools as _functools
+    try:
+        loop = _asyncio.get_event_loop()
+    except RuntimeError:
+        loop = _asyncio.new_event_loop()
+    _mega = Mega()
+    # Run blocking login in thread so async loop is not blocked
+    try:
+        m = loop.run_until_complete(
+            loop.run_in_executor(None, _functools.partial(_mega.login, email, password))
+        )
+    except Exception:
+        # If we already have a running loop, fall back to direct call
+        try:
+            m = _mega.login(email, password)
+        except Exception as exc2:
+            raise ConnectionError(f"MEGA login error: {exc2}") from exc2
     if not m:
         raise ConnectionError("mega_auth_failed")
     return m
@@ -249,15 +264,38 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text="🔐 Verifying your MEGA credentials…",
     )
 
+    import asyncio as _asyncio, functools as _functools
+
+    m = None
+    login_error = None
     try:
-        mega = Mega()
-        m    = mega.login(email, password)
-        if not m:
-            raise ConnectionError("MEGA returned a falsy session.")
+        # Run blocking mega.py login() in a thread executor
+        loop = _asyncio.get_event_loop()
+        _mega = Mega()
+        m = await loop.run_in_executor(
+            None, _functools.partial(_mega.login, email, password)
+        )
     except Exception as exc:
-        logger.warning("MEGA login failed for user %s: %s", user.id, exc)
+        login_error = exc
+        logger.warning("MEGA login exception for user %s: %s", user.id, exc)
+
+    # Confirm session is truly alive by fetching account info
+    if m is not None and login_error is None:
+        try:
+            loop = _asyncio.get_event_loop()
+            await loop.run_in_executor(None, m.get_user)
+        except Exception as exc:
+            login_error = exc
+            m = None
+            logger.warning("MEGA get_user failed for user %s: %s", user.id, exc)
+
+    if m is None:
+        err_str = str(login_error) if login_error else "Unknown error"
         await wait_msg.edit_text(
-            "❌ *Login failed.* Please check your email and password and try again.",
+            "❌ *Login failed.*\n\n"
+            "Please double-check your MEGA email and password.\n"
+            "⚠️ If you have 2FA enabled on MEGA, disable it first.\n\n"
+            f"Error: `{err_str[:200]}`",
             parse_mode="Markdown",
         )
         return
