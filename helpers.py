@@ -4,6 +4,7 @@
 
 import logging
 from datetime import date, datetime, timezone
+from typing import Optional, Tuple
 from cryptography.fernet import Fernet, InvalidToken
 
 from config import ENCRYPTION_KEY, PLANS, DEFAULT_PLAN
@@ -50,13 +51,13 @@ def format_gb(gb: float) -> str:
     return f"{gb:.2f} GB"
 
 
-def get_daily_limit(plan: str) -> float | None:
+def get_daily_limit(plan: str) -> Optional[float]:
     """Return daily GB limit for *plan*; None means unlimited."""
     plan_data = PLANS.get(plan, PLANS[DEFAULT_PLAN])
     return plan_data["daily_gb"]   # int or None
 
 
-def needs_quota_reset(last_reset_date_str: str | None) -> bool:
+def needs_quota_reset(last_reset_date_str: Optional[str]) -> bool:
     """Return True if the user's quota should be reset (new calendar day)."""
     if not last_reset_date_str:
         return True
@@ -114,7 +115,7 @@ def apply_quota_reset(user_doc: dict) -> dict:
     return user_doc
 
 
-def check_quota(user_doc: dict, file_size_gb: float) -> tuple[bool, str]:
+def check_quota(user_doc: dict, file_size_gb: float) -> Tuple[bool, str]:
     """Check whether a rename of *file_size_gb* is allowed.
 
     Returns (allowed: bool, message: str).
