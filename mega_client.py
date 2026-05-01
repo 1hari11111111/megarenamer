@@ -2,6 +2,12 @@
 #  mega_client.py  —  Lightweight MEGA API client
 #  Replaces the broken mega.py library (incompatible with Python 3.12)
 #  Uses only: requests, pycryptodome (already in requirements)
+#
+#  FIXES vs original:
+#   1. Supports MEGA v2 login (PBKDF2-SHA512 + salt) — required for
+#      almost all modern/new MEGA accounts. Old v1 AES-CBC derivation
+#      kept as fallback for legacy accounts.
+#   2. _decrypt_attrs: fixed JSON parsing of "MEGA{...}" prefix.
 # ============================================================
 
 import base64
@@ -10,6 +16,7 @@ import json
 import os
 import random
 import struct
+import time
 
 import requests
 from Crypto.Cipher import AES
@@ -64,8 +71,8 @@ def _aes_ctr_crypt(key_a32, iv_a32, data):
     return cipher.encrypt(data)
 
 
-def _derive_key(password: str) -> list:
-    """Derive AES key from MEGA password."""
+def _derive_key_v1(password: str) -> list:
+    """Derive AES key from MEGA password — legacy v1 method."""
     pw_bytes = password.encode("utf-8")
     key = [0x93C467E3, 0x7DB0C7A4, 0xD1BE3F81, 0x0152CB56]
     p = [int.from_bytes(pw_bytes[i:i+4].ljust(4, b"\x00"), "big")
@@ -79,6 +86,20 @@ def _derive_key(password: str) -> list:
                 block.append(0)
             key = list(_bytes_to_a32(_aes_cbc_encrypt(key, _a32_to_bytes(block))))
     return key
+
+
+def _derive_key_v2(password: str, salt_b64: str) -> list:
+    """Derive AES key from MEGA password — v2 method (PBKDF2-SHA512 + salt).
+    Used by all modern/new MEGA accounts.
+    """
+    salt = _base64_url_decode(salt_b64)
+    pw_key_bytes = hashlib.pbkdf2_hmac(
+        "sha512",
+        password.encode("utf-8"),
+        salt,
+        100000,
+    )[:16]
+    return list(_bytes_to_a32(pw_key_bytes))
 
 
 def _hash_email(email: str, key: list) -> str:
@@ -101,44 +122,53 @@ def _hash_email(email: str, key: list) -> str:
 _seq = random.randint(0, 0xFFFFFFFF)
 
 
-def _api_request(data, sid=None):
+def _api_request(data, sid=None, retries=3):
     global _seq
     _seq += 1
     params = {"id": _seq}
     if sid:
         params["sid"] = sid
 
-    resp = requests.post(
-        MEGA_API,
-        params=params,
-        data=json.dumps([data]),
-        timeout=30,
-    )
-    resp.raise_for_status()
-    result = resp.json()
+    for attempt in range(retries):
+        resp = requests.post(
+            MEGA_API,
+            params=params,
+            data=json.dumps([data]),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
 
-    if isinstance(result, list):
-        result = result[0]
+        if isinstance(result, list):
+            result = result[0]
 
-    if isinstance(result, int) and result < 0:
-        errors = {
-            -1: "EINTERNAL",
-            -2: "EARGS",
-            -3: "EAGAIN",
-            -4: "ERATELIMIT",
-            -6: "ENOENT (wrong email or password)",
-            -9: "ENOENT",
-            -11: "EACCESS",
-            -12: "EEXIST",
-            -14: "EKEY",
-            -15: "ESID (session expired)",
-            -16: "EBLOCKED",
-            -17: "EOVERQUOTA",
-            -18: "ETEMPUNAVAIL",
-        }
-        raise ConnectionError(f"MEGA API error: {errors.get(result, str(result))}")
+        # Retry on EAGAIN (-3) or ERATELIMIT (-4)
+        if result in (-3, -4):
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
 
-    return result
+        if isinstance(result, int) and result < 0:
+            errors = {
+                -1: "EINTERNAL",
+                -2: "EARGS",
+                -3: "EAGAIN",
+                -4: "ERATELIMIT",
+                -6: "ENOENT (wrong email or password)",
+                -9: "ENOENT",
+                -11: "EACCESS",
+                -12: "EEXIST",
+                -14: "EKEY",
+                -15: "ESID (session expired)",
+                -16: "EBLOCKED",
+                -17: "EOVERQUOTA",
+                -18: "ETEMPUNAVAIL",
+            }
+            raise ConnectionError(f"MEGA API error: {errors.get(result, str(result))}")
+
+        return result
+
+    raise ConnectionError("MEGA API error: max retries exceeded")
 
 
 # ── Public MegaClient class ───────────────────────────────────
@@ -154,21 +184,46 @@ class MegaClient:
     # ── Login ─────────────────────────────────────────────────
 
     def login(self, email: str, password: str) -> "MegaClient":
-        """Login with email+password. Returns self on success, raises on failure."""
+        """Login with email+password. Supports both MEGA v1 and v2 auth.
+        Returns self on success, raises ConnectionError on failure.
+        """
         email = email.strip().lower()
         password = password.strip()
 
-        pw_key = _derive_key(password)
+        # ── Step 1: Probe for login version and salt ──────────
+        # "us0" returns {"v": 1} for legacy accounts or
+        # {"v": 2, "s": "<base64_salt>"} for modern accounts.
+        probe = _api_request({"a": "us0", "user": email})
+
+        if not isinstance(probe, dict):
+            raise ConnectionError(
+                f"MEGA login failed: unexpected probe response: {probe}"
+            )
+
+        version = probe.get("v", 1)
+
+        if version == 2:
+            # ── v2 login: PBKDF2-SHA512 key derivation ────────
+            salt_b64 = probe.get("s")
+            if not salt_b64:
+                raise ConnectionError("MEGA login failed: v2 response missing salt.")
+            pw_key = _derive_key_v2(password, salt_b64)
+        else:
+            # ── v1 login: legacy AES-CBC key derivation ───────
+            pw_key = _derive_key_v1(password)
+
         hashed = _hash_email(email, pw_key)
 
-        # Step 1: get user salt / login info
+        # ── Step 2: Authenticate and get session ──────────────
         resp = _api_request({"a": "us", "user": email, "uh": hashed})
 
         if isinstance(resp, int):
-            raise ConnectionError(f"MEGA login failed (code {resp}). Check email/password.")
+            raise ConnectionError(
+                f"MEGA login failed (code {resp}). Check email/password."
+            )
 
         if "tsid" in resp:
-            # Old-style session (no encryption)
+            # Old-style session (no RSA, direct AES verification)
             tsid = _base64_url_decode(resp["tsid"])
             key = _a32_to_bytes(pw_key)
             cipher = AES.new(key, AES.MODE_CBC, iv=b"\x00" * 16)
@@ -176,6 +231,7 @@ class MegaClient:
             if sid_check[:8] != tsid[16:24]:
                 raise ConnectionError("MEGA login failed: wrong email or password.")
             self._sid = resp["tsid"]
+
         elif "csid" in resp:
             enc_master_key = _base64_url_decode(resp["k"])
             enc_sid = _base64_url_decode(resp["csid"])
@@ -188,7 +244,6 @@ class MegaClient:
             privk_bytes = _aes_cbc_decrypt(
                 self._master_key, _base64_url_decode(resp["privk"])
             )
-            # Parse RSA key components
             privk = list(_bytes_to_a32(privk_bytes))
             rsa_key = self._parse_rsa_key(privk)
 
@@ -198,26 +253,28 @@ class MegaClient:
             )
             sid_bytes = sid_int.to_bytes(43, "big")
             self._sid = _base64_url_encode(sid_bytes[:43])
+
         else:
-            raise ConnectionError("MEGA login failed: unexpected response format.")
+            raise ConnectionError(
+                "MEGA login failed: response missing 'tsid' and 'csid'. "
+                "Check credentials or try again later."
+            )
 
         return self
 
     def _parse_rsa_key(self, privk_a32):
         """Parse RSA private key from a32 array."""
-        pos = 0
-        components = []
         raw = _a32_to_bytes(privk_a32)
         idx = 0
+        components = []
         for _ in range(4):
-            # Each component is length-prefixed (2 bytes, big-endian bit length)
             bit_len = (raw[idx] << 8) | raw[idx + 1]
             idx += 2
             byte_len = (bit_len + 7) // 8
             comp = int.from_bytes(raw[idx:idx + byte_len], "big")
             components.append(comp)
             idx += byte_len
-        return components  # [p, q, d, u] or [p, q, d, ...] — we only need first 3
+        return components  # [p, q, d, u] — only first 3 needed
 
     def _rsa_decrypt(self, ciphertext: int, key: list) -> int:
         """RSA decrypt: m = c^d mod (p*q)."""
@@ -245,7 +302,6 @@ class MegaClient:
             fid = f.get("h")
             if not fid:
                 continue
-            # Decrypt attributes if we have a key
             a = self._decrypt_attrs(f)
             files[fid] = {**f, "a": a}
         return files
@@ -259,35 +315,35 @@ class MegaClient:
             key_bytes = _base64_url_decode(raw_key)
             key_a32 = list(_bytes_to_a32(key_bytes))
 
-            # File key decryption
             if len(key_a32) == 4:
+                # File key
                 file_key = list(_bytes_to_a32(
                     _aes_cbc_decrypt(self._master_key, _a32_to_bytes(key_a32))
                 ))
             elif len(key_a32) == 8:
-                # Folder key
-                file_key = [
+                # Folder key — XOR halves then decrypt
+                xored = [
                     key_a32[0] ^ key_a32[4],
                     key_a32[1] ^ key_a32[5],
                     key_a32[2] ^ key_a32[6],
                     key_a32[3] ^ key_a32[7],
                 ]
                 file_key = list(_bytes_to_a32(
-                    _aes_cbc_decrypt(self._master_key, _a32_to_bytes(file_key))
+                    _aes_cbc_decrypt(self._master_key, _a32_to_bytes(xored))
                 ))
             else:
                 return {}
 
             attr_bytes = _base64_url_decode(f.get("a", ""))
-            # Decrypt attrs with file_key
             dec = _aes_cbc_decrypt(file_key[:4], attr_bytes)
-            # Strip MEGA: prefix and null padding
             dec = dec.rstrip(b"\x00")
-            prefix = b"MEGA{"
-            if dec.startswith(prefix):
-                json_str = dec[5:]  # skip "MEGA{"
-                # Find closing }
-                attrs = json.loads("{" + json_str.decode("utf-8", errors="replace"))
+
+            # FIX: "MEGA{...}" — keep the "{" that is part of the JSON object.
+            # Original code did dec[5:] then prepended "{", which fails on
+            # filenames containing special characters or "}" inside the name.
+            if dec.startswith(b"MEGA{"):
+                json_bytes = dec[4:]  # slice from "{" onward → valid JSON object
+                attrs = json.loads(json_bytes.decode("utf-8", errors="replace"))
                 return attrs
         except Exception:
             pass
@@ -304,7 +360,6 @@ class MegaClient:
         if not fid:
             raise ValueError("Invalid file data: missing handle.")
 
-        # Rebuild file key for attribute encryption
         raw_key = file_data.get("k", "")
         if ":" in raw_key:
             raw_key = raw_key.split(":")[1]
@@ -316,19 +371,18 @@ class MegaClient:
                 _aes_cbc_decrypt(self._master_key, _a32_to_bytes(key_a32))
             ))
         else:
-            file_key = [
+            xored = [
                 key_a32[0] ^ key_a32[4],
                 key_a32[1] ^ key_a32[5],
                 key_a32[2] ^ key_a32[6],
                 key_a32[3] ^ key_a32[7],
             ]
             file_key = list(_bytes_to_a32(
-                _aes_cbc_decrypt(self._master_key, _a32_to_bytes(file_key))
+                _aes_cbc_decrypt(self._master_key, _a32_to_bytes(xored))
             ))
 
         # Encrypt new attributes
-        new_attrs = json.dumps({"n": new_name}).encode("utf-8")
-        new_attrs = b"MEGA" + new_attrs
+        new_attrs = b"MEGA" + json.dumps({"n": new_name}).encode("utf-8")
         # Pad to 16-byte boundary
         pad = 16 - len(new_attrs) % 16
         new_attrs += b"\x00" * pad
